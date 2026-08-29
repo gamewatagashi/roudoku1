@@ -322,8 +322,8 @@ def make_srt(segments, speed_factor=1.0):
 
 def tts(client, text, voice):
     """
-    Gemini TTSで日本語音声を生成。
-    長い文章は呼び出し側で分割する。
+    Gemini TTSで日本語音声を生成する。
+    返り値はWAVではなく、Geminiが返したPCMデータをWAV化したもの。
     """
 
     text = str(text).strip()
@@ -331,15 +331,13 @@ def tts(client, text, voice):
     if not text:
         raise RuntimeError("TTSに渡す文章が空です。")
 
-    # 指示と本文を明確に分離
-    prompt = f"""
-Read the following Japanese text naturally and expressively.
-Do not add, remove, translate, or explain anything.
-Only speak the Japanese text.
-
-Japanese text:
-{text}
-"""
+    prompt = (
+        "Read the following Japanese text naturally and expressively. "
+        "Speak only the Japanese text. "
+        "Do not explain it, translate it, or add any words.\n\n"
+        "Japanese text:\n"
+        + text
+    )
 
     r = client.interactions.create(
         model="gemini-3.1-flash-tts-preview",
@@ -354,22 +352,23 @@ Japanese text:
         }
     )
 
-    if not getattr(r, "output_audio", None):
-        raise RuntimeError(
-            "Geminiから音声データが返されませんでした。"
-        )
+    # Geminiの音声データを取得
+    if not hasattr(r, "output_audio") or r.output_audio is None:
+        raise RuntimeError("Geminiから音声データが返されませんでした。")
 
-    raw = r.output_audio.data
+    audio_data = r.output_audio.data
 
-    if isinstance(raw, str):
-        pcm = base64.b64decode(raw)
+    if audio_data is None:
+        raise RuntimeError("Geminiから空の音声データが返されました。")
+
+    # Base64文字列の場合
+    if isinstance(audio_data, str):
+        pcm_data = base64.b64decode(audio_data)
     else:
-        pcm = raw
+        pcm_data = bytes(audio_data)
 
-    if not pcm:
-        raise RuntimeError(
-            "Geminiから空の音声データが返されました。"
-        )
+    if not pcm_data:
+        raise RuntimeError("音声データが空です。")
 
     # PCM → WAV
     wav_buffer = io.BytesIO()
@@ -378,7 +377,7 @@ Japanese text:
         wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(24000)
-        wf.writeframes(pcm)
+        wf.writeframes(pcm_data)
 
     return wav_buffer.getvalue()
 
