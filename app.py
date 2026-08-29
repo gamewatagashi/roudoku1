@@ -1,1385 +1,790 @@
 import io
 import json
-import base64
-import wave
 import re
-import array
 import time
+import wave
+import zipfile
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Optional, Tuple
 
+import requests
 import streamlit as st
-from google import genai
 
+try:
+    from google import genai
+    from google.genai import types
+except Exception:
+    genai = None
+    types = None
 
 # =========================================================
-# 基本設定
+# 5分で名作 — local AivisSpeech / Gemini TTS edition
 # =========================================================
+# Design goals:
+# - Keep original -> Gemini script generation.
+# - Accept a completed script in the user's rich format.
+# - Prefer FREE local AivisSpeech Engine for TTS.
+# - Keep Gemini TTS as an optional cloud fallback.
+# - Build an explicit timeline instead of simply concatenating files.
+# - Support simultaneous dialogue, waits, SE/BGM/image cues.
+# - Suggest copyright-safer SE/BGM sources without bundling copyrighted assets.
+# - Export WAV, 1.5x WAV, SRT, timeline JSON and credits.
 
-st.set_page_config(
-    page_title="5分で名作",
-    page_icon="📖",
-    layout="wide"
-)
+st.set_page_config(page_title="5分で名作", page_icon="📖", layout="wide")
 
-TTS_MODEL = "gemini-3.1-flash-tts-preview"
-SCRIPT_MODEL = "gemini-3.6-flash"
-
-# Gemini TTSの公式例に合わせる
-SAMPLE_RATE = 24000
-CHANNELS = 1
-SAMPLE_WIDTH = 2
-
-# 通常時の1チャンクの目安
-# 長すぎる入力を避け、声の安定性と失敗率のバランスを取る
-DEFAULT_CHUNK_CHARS = 450
-
-# Safety等で失敗したとき、さらに細かくする
-RETRY_CHUNK_CHARS = 220
-
-MAX_RETRIES = 3
-
+AIVIS_DEFAULT_URL = "http://127.0.0.1:10101"
+GEMINI_TTS_MODEL = "gemini-3.1-flash-tts-preview"
+GEMINI_SCRIPT_MODEL = "gemini-3.6-flash"
 SPEED = 1.5
+SAMPLE_RATE = 24000
 
-
-# =========================================================
-# キャスト
-# =========================================================
-
-VOICES = [
-    "Zephyr",
-    "Puck",
-    "Charon",
-    "Kore",
-    "Fenrir",
-    "Leda",
-    "Orus",
-    "Aoede",
-    "Callirrhoe",
-    "Autonoe",
-    "Enceladus",
-    "Iapetus",
-    "Umbriel",
-    "Algieba",
-    "Despina",
-    "Erinome",
-    "Algenib",
-    "Rasalgethi",
-    "Laomedeia",
-    "Achernar",
-    "Alnilam",
-    "Schedar",
-    "Gacrux",
-    "Pulcherrima",
-    "Achird",
-    "Zubenelgenubi",
-    "Vindemiatrix",
-    "Sadachbia",
-    "Sadaltager",
-    "Sulafat"
+# Gemini voices retained as optional voices.
+GEMINI_VOICES = [
+    "Rasalgethi", "Algieba", "Alnilam", "Aoede", "Iapetus", "Schedar",
+    "Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Leda", "Orus",
 ]
 
-DEFAULT = {
-    "ナレーター": "Rasalgethi",
-    "メロス": "Iapetus",
-    "王": "Algieba",
-    "セリヌンティウス": "Alnilam",
-    "妹": "Aoede",
-    "フィロストラトス": "Schedar"
+# Fallback mapping used only when a completed script does not provide explicit model/style IDs.
+DEFAULT_ROLE_MAP = {
+    "NARRATOR": {"label": "ナレーター", "gemini": "Rasalgethi"},
+    "MEROS": {"label": "メロス", "gemini": "Iapetus"},
+    "DIONYS": {"label": "ディオニス／王", "gemini": "Algieba"},
+    "SELINUNTIUS": {"label": "セリヌンティウス", "gemini": "Alnilam"},
+    "FILOSTRATUS": {"label": "フィロストラトス", "gemini": "Schedar"},
+    "SISTER": {"label": "妹", "gemini": "Aoede"},
 }
 
-
 # =========================================================
-# WAV関連
+# Audio utilities
 # =========================================================
 
-def pcm_to_wav(pcm: bytes) -> bytes:
-    """
-    Gemini TTSの生PCMをWAVに変換する。
-    Gemini公式サンプルと同じ24kHz / 16bit / mono。
-    """
-
-    wav_buffer = io.BytesIO()
-
-    with wave.open(wav_buffer, "wb") as wf:
-        wf.setnchannels(CHANNELS)
-        wf.setsampwidth(SAMPLE_WIDTH)
-        wf.setframerate(SAMPLE_RATE)
+def pcm_to_wav(pcm: bytes, sample_rate: int = SAMPLE_RATE, channels: int = 1, sample_width: int = 2) -> bytes:
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(sample_width)
+        wf.setframerate(sample_rate)
         wf.writeframes(pcm)
-
-    return wav_buffer.getvalue()
-
-
-def duration(wav_bytes: bytes) -> float:
-    """WAVの長さを秒で取得"""
-
-    with wave.open(io.BytesIO(wav_bytes), "rb") as w:
-        return w.getnframes() / w.getframerate()
+    return out.getvalue()
 
 
-def join_wav(parts):
-    """複数のWAVを一本に結合"""
+def wav_info(data: bytes) -> Tuple[int, int, int, int]:
+    with wave.open(io.BytesIO(data), "rb") as wf:
+        return wf.getnchannels(), wf.getsampwidth(), wf.getframerate(), wf.getnframes()
 
+
+def wav_duration(data: bytes) -> float:
+    try:
+        with wave.open(io.BytesIO(data), "rb") as wf:
+            return wf.getnframes() / float(wf.getframerate())
+    except Exception:
+        return 0.0
+
+
+def ensure_wav(data: bytes) -> bytes:
+    if data[:4] == b"RIFF":
+        return data
+    return pcm_to_wav(data)
+
+
+def silence_wav(seconds: float, sample_rate: int = SAMPLE_RATE) -> bytes:
+    frames = max(0, int(seconds * sample_rate))
+    return pcm_to_wav(b"\x00\x00" * frames, sample_rate=sample_rate)
+
+
+def mix_wavs(base: bytes, overlay: bytes, start_seconds: float = 0.0) -> bytes:
+    """Mix two mono 16-bit WAVs, placing overlay at start_seconds."""
+    import array
+    with wave.open(io.BytesIO(base), "rb") as wb:
+        sr_b = wb.getframerate(); ch_b = wb.getnchannels(); sw_b = wb.getsampwidth(); raw_b = wb.readframes(wb.getnframes())
+    with wave.open(io.BytesIO(overlay), "rb") as wo:
+        sr_o = wo.getframerate(); ch_o = wo.getnchannels(); sw_o = wo.getsampwidth(); raw_o = wo.readframes(wo.getnframes())
+    if not (sr_b == sr_o == SAMPLE_RATE and ch_b == ch_o == 1 and sw_b == sw_o == 2):
+        raise ValueError("WAV format mismatch. 24kHz/mono/16bit WAV is required.")
+    a = array.array("h"); a.frombytes(raw_b)
+    b = array.array("h"); b.frombytes(raw_o)
+    offset = int(start_seconds * SAMPLE_RATE)
+    need = max(len(a), offset + len(b))
+    if len(a) < need:
+        a.extend([0] * (need - len(a)))
+    for i, sample in enumerate(b):
+        j = offset + i
+        v = a[j] + sample
+        a[j] = max(-32768, min(32767, v))
+    return pcm_to_wav(a.tobytes())
+
+
+def concat_wavs(parts: List[bytes]) -> bytes:
+    parts = [ensure_wav(p) for p in parts if p]
     if not parts:
-        return b""
-
-    first = io.BytesIO(parts[0])
-
-    with wave.open(first, "rb") as w:
-        params = w.getparams()
-
-    output = io.BytesIO()
-
-    with wave.open(output, "wb") as out:
-        out.setparams(params)
-
-        for part in parts:
-            with wave.open(io.BytesIO(part), "rb") as w:
-                frames = w.readframes(w.getnframes())
-                out.writeframes(frames)
-
-    return output.getvalue()
+        return silence_wav(0.05)
+    with wave.open(io.BytesIO(parts[0]), "rb") as w0:
+        params = w0.getparams()
+        frames = [w0.readframes(w0.getnframes())]
+    for data in parts[1:]:
+        with wave.open(io.BytesIO(data), "rb") as wf:
+            p = wf.getparams()
+            if (p.nchannels, p.sampwidth, p.framerate) != (params.nchannels, params.sampwidth, params.framerate):
+                raise ValueError("All WAV files must have the same format.")
+            frames.append(wf.readframes(wf.getnframes()))
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wf:
+        wf.setparams(params)
+        for fr in frames:
+            wf.writeframes(fr)
+    return out.getvalue()
 
 
-def speed_up(wav_bytes: bytes, factor=1.5) -> bytes:
+def speed_up_wav(data: bytes, factor: float = SPEED) -> bytes:
+    """Simple time compression by frame decimation/interpolation-free resampling.
+    This changes pitch slightly; it is deliberately conservative and dependency-free.
     """
-    音声を単純なサンプル間引きで高速化。
-    今回は編集時に1.5倍速前提なので、
-    ここでは音程を大きく変えずに簡易高速化する。
-    """
-
-    with wave.open(io.BytesIO(wav_bytes), "rb") as w:
-        params = w.getparams()
-        raw = w.readframes(w.getnframes())
-
-    if params.sampwidth != 2:
-        return wav_bytes
-
-    samples = array.array("h")
-    samples.frombytes(raw)
-
-    frames = len(samples) // params.nchannels
-
-    result = array.array("h")
-
-    index = 0.0
-
-    while int(index) < frames:
-        frame_index = int(index) * params.nchannels
-
-        result.extend(
-            samples[
-                frame_index:
-                frame_index + params.nchannels
-            ]
-        )
-
-        index += factor
-
-    output = io.BytesIO()
-
-    with wave.open(output, "wb") as w:
-        w.setnchannels(params.nchannels)
-        w.setsampwidth(2)
-        w.setframerate(params.framerate)
-        w.writeframes(result.tobytes())
-
-    return output.getvalue()
-
+    import array
+    with wave.open(io.BytesIO(data), "rb") as wf:
+        sr = wf.getframerate(); ch = wf.getnchannels(); sw = wf.getsampwidth(); raw = wf.readframes(wf.getnframes())
+    if ch != 1 or sw != 2:
+        return data
+    arr = array.array("h"); arr.frombytes(raw)
+    step = max(1, factor)
+    out = array.array("h")
+    idx = 0.0
+    while int(idx) < len(arr):
+        out.append(arr[int(idx)])
+        idx += step
+    return pcm_to_wav(out.tobytes(), sr, 1, 2)
 
 # =========================================================
-# 文章分割
+# Script parsing
 # =========================================================
 
-def normalize_text(text):
-    """TTSに渡す文章を軽く整理"""
-
-    text = text.replace("\r\n", "\n")
-    text = text.replace("\r", "\n")
-
-    # 連続空白を整理
-    text = re.sub(r"[ \t]+", " ", text)
-
-    # 連続改行を整理
-    text = re.sub(r"\n{3,}", "\n\n", text)
-
-    return text.strip()
+@dataclass
+class Segment:
+    index: int
+    speaker: str
+    text: str
+    direction: str = ""
+    simultaneous_group: Optional[str] = None
+    start: Optional[float] = None
+    kind: str = "speech"  # speech / wait / cue
+    cue_type: str = ""
+    cue_text: str = ""
 
 
-def split_text(text, max_chars=DEFAULT_CHUNK_CHARS):
+def clean_text(text: str) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"^['\"「『]|['\"」』]$", "", text).strip()
+    return text
+
+
+def parse_script(text: str) -> Tuple[Dict[str, str], List[Segment], List[Dict]]:
+    """Parse the user's requested format.
+
+    Supports:
+      [SPEAKER | direction]
+      [SPEAKER]
+      [SPEAKER & SPEAKER | direction]
+      [SE想定：...]
+      [BGM：...]
+      [画像：...]
+      [WAIT 1.5]
+      [END]
+    Also accepts the VOICE CAST section as metadata.
     """
-    日本語文章を意味がなるべく切れないように分割。
+    cast = {}
+    segments: List[Segment] = []
+    cues: List[Dict] = []
+    current_speaker = None
+    current_direction = ""
+    buffer: List[str] = []
+    idx = 1
 
-    優先順位:
-    1. 句点
-    2. 読点
-    3. 改行
-    4. それでも長ければ文字数
-    """
+    def flush():
+        nonlocal idx, buffer
+        if not buffer or not current_speaker:
+            buffer = []
+            return
+        txt = clean_text("\n".join(buffer))
+        if txt:
+            segments.append(Segment(idx, current_speaker, txt, current_direction))
+            idx += 1
+        buffer = []
 
-    text = normalize_text(text)
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    in_script = False
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        if line.upper().startswith("# SCRIPT"):
+            in_script = True
+            continue
+        if line.upper().startswith("# VOICE CAST"):
+            in_script = False
+            continue
+        if not in_script and line.startswith("###"):
+            # Store the character description as cast metadata until SCRIPT begins.
+            name = line.lstrip("# ").strip().upper()
+            cast.setdefault(name, "")
+            continue
+        if not in_script and cast:
+            # Description lines are attached to the most recent ### role.
+            if cast:
+                last = list(cast.keys())[-1]
+                if line.startswith("#"):
+                    continue
+                cast[last] = (cast[last] + " " + line).strip()
+            continue
+        if not in_script:
+            # If there is no explicit # SCRIPT, treat first dialogue marker as script start.
+            if not line.startswith("["):
+                continue
+            in_script = True
 
-    if not text:
-        return []
+        if line == "[END]":
+            flush(); break
+        m_wait = re.match(r"^\[\s*WAIT\s+([0-9]+(?:\.[0-9]+)?)\s*\]$", line, re.I)
+        if m_wait:
+            flush()
+            segments.append(Segment(idx, "", "", kind="wait", start=float(m_wait.group(1))))
+            idx += 1
+            continue
+        m_cue = re.match(r"^\[\s*(SE|SE想定|BGM|画像|IMAGE)\s*[:：]\s*(.*?)\s*\]$", line, re.I)
+        if m_cue:
+            flush()
+            typ = m_cue.group(1).upper()
+            typ = "SE" if typ.startswith("SE") else ("BGM" if typ == "BGM" else "IMAGE")
+            cues.append({"index": idx, "type": typ, "text": m_cue.group(2)})
+            segments.append(Segment(idx, "", "", kind="cue", cue_type=typ, cue_text=m_cue.group(2)))
+            idx += 1
+            continue
+        m = re.match(r"^\[\s*(.*?)\s*(?:\|\s*(.*?))?\s*\]$", line)
+        if m:
+            flush()
+            current_speaker = m.group(1).strip().upper()
+            current_direction = (m.group(2) or "").strip()
+            continue
+        if line.startswith("#"):
+            continue
+        if current_speaker:
+            buffer.append(line)
+    flush()
 
-    if len(text) <= max_chars:
-        return [text]
+    # If no explicit script markers were found, support simple "NAME: text" lines.
+    if not segments:
+        for raw in lines:
+            m = re.match(r"^\s*([^:：]{1,30})[:：]\s*(.+)$", raw.strip())
+            if m:
+                segments.append(Segment(len(segments)+1, m.group(1).strip().upper(), clean_text(m.group(2))))
 
-    chunks = []
+    # Add default cast descriptions for roles not explicitly described.
+    for role, meta in DEFAULT_ROLE_MAP.items():
+        cast.setdefault(role, "")
+    return cast, segments, cues
 
-    remaining = text
 
-    punctuation = "。！？!?」』"
+def speaker_label(name: str) -> str:
+    key = name.upper().strip()
+    if key in DEFAULT_ROLE_MAP:
+        return DEFAULT_ROLE_MAP[key]["label"]
+    aliases = {
+        "王": "ディオニス／王", "ディオニス": "ディオニス／王",
+        "メロス": "メロス", "セリヌンティウス": "セリヌンティウス",
+        "フィロストラトス": "フィロストラトス", "老人": "老人", "山賊": "山賊",
+        "妹": "妹", "ナレーター": "ナレーター",
+    }
+    return aliases.get(key, name)
 
-    while len(remaining) > max_chars:
 
-        search_area = remaining[:max_chars]
+def normalize_role(name: str) -> str:
+    n = name.strip().upper()
+    aliases = {
+        "ナレーター": "NARRATOR", "NARRATION": "NARRATOR", "ナレーション": "NARRATOR",
+        "メロス": "MEROS", "王": "DIONYS", "ディオニス": "DIONYS",
+        "セリヌンティウス": "SELINUNTIUS", "フィロストラトス": "FILOSTRATUS",
+        "妹": "SISTER",
+    }
+    return aliases.get(n, n)
 
-        cut_positions = [
-            i + 1
-            for i, char in enumerate(search_area)
-            if char in punctuation
-        ]
+# =========================================================
+# AivisSpeech local API
+# =========================================================
 
-        if cut_positions:
-            cut = max(cut_positions)
+def aivis_get_speakers(base_url: str) -> List[Dict]:
+    r = requests.get(base_url.rstrip("/") + "/speakers", timeout=5)
+    r.raise_for_status()
+    return r.json()
 
+
+def flatten_aivis_speakers(raw: List[Dict]) -> List[Dict]:
+    out = []
+    for sp in raw:
+        for style in sp.get("styles", []):
+            out.append({
+                "speaker_id": style.get("id"),
+                "speaker_name": sp.get("name", ""),
+                "style_name": style.get("name", ""),
+                "uuid": sp.get("speaker_uuid", ""),
+            })
+    return [x for x in out if x.get("speaker_id") is not None]
+
+
+def aivis_synthesize(base_url: str, text: str, speaker_id: int, speed: float = 1.0, intonation: float = 1.0) -> bytes:
+    base = base_url.rstrip("/")
+    q = requests.post(base + "/audio_query", params={"speaker": speaker_id}, data=text.encode("utf-8"), timeout=60)
+    q.raise_for_status()
+    query = q.json()
+    query["speedScale"] = float(speed)
+    # AivisSpeech uses intonationScale for style emotion strength.
+    query["intonationScale"] = max(0.0, min(2.0, float(intonation)))
+    s = requests.post(base + "/synthesis", params={"speaker": speaker_id}, json=query, timeout=120)
+    s.raise_for_status()
+    return ensure_wav(s.content)
+
+# =========================================================
+# Gemini TTS optional
+# =========================================================
+
+def gemini_synthesize(client, text: str, voice: str, direction: str = "") -> bytes:
+    prompt = text
+    if direction:
+        prompt = f"演技指示: {direction}\n\n{text}"
+    response = client.models.generate_content(
+        model=GEMINI_TTS_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
+                )
+            ),
+        ),
+    )
+    parts = getattr(response, "candidates", [])
+    for cand in parts:
+        content = getattr(cand, "content", None)
+        if not content:
+            continue
+        for part in getattr(content, "parts", []) or []:
+            inline = getattr(part, "inline_data", None)
+            if inline and getattr(inline, "data", None):
+                return ensure_wav(inline.data)
+    raise RuntimeError("Gemini TTSから音声データが返されませんでした。")
+
+# =========================================================
+# Timeline
+# =========================================================
+
+def build_timeline(segments: List[Segment], audio_by_index: Dict[int, bytes], pause: float = 0.12) -> List[Dict]:
+    timeline = []
+    cursor = 0.0
+    simultaneous_cursor: Dict[str, float] = {}
+    for seg in segments:
+        if seg.kind == "wait":
+            cursor += float(seg.start or 0.0)
+            timeline.append({"index": seg.index, "kind": "wait", "start": cursor, "duration": float(seg.start or 0.0)})
+            continue
+        if seg.kind == "cue":
+            timeline.append({"index": seg.index, "kind": seg.cue_type, "cue": seg.cue_text, "start": cursor})
+            continue
+        audio = audio_by_index.get(seg.index)
+        if not audio:
+            continue
+        dur = wav_duration(audio)
+        group = seg.simultaneous_group
+        if group:
+            # Same group starts at the same cursor. Group ends at max duration.
+            start = cursor
+            timeline.append({"index": seg.index, "kind": "speech", "speaker": seg.speaker,
+                              "direction": seg.direction, "text": seg.text, "start": start, "duration": dur,
+                              "simultaneous_group": group})
+            simultaneous_cursor[group] = max(simultaneous_cursor.get(group, start), start + dur)
+            # Do not advance cursor until the last group member; parser sets group members consecutively.
+            next_seg = segments[segments.index(seg)+1] if segments.index(seg)+1 < len(segments) else None
+            if not next_seg or next_seg.simultaneous_group != group:
+                cursor = simultaneous_cursor[group] + pause
         else:
-            # 読点・改行を探す
-            comma_positions = [
-                i + 1
-                for i, char in enumerate(search_area)
-                if char in "、,\n"
-            ]
+            start = cursor
+            timeline.append({"index": seg.index, "kind": "speech", "speaker": seg.speaker,
+                              "direction": seg.direction, "text": seg.text, "start": start, "duration": dur})
+            cursor += dur + pause
+    return timeline
 
-            if comma_positions:
-                cut = max(comma_positions)
 
-            else:
-                cut = max_chars
-
-        chunk = remaining[:cut].strip()
-
-        if chunk:
-            chunks.append(chunk)
-
-        remaining = remaining[cut:].strip()
-
-    if remaining:
-        chunks.append(remaining)
-
-    return chunks
-
+def render_mix(timeline: List[Dict], audio_by_index: Dict[int, bytes]) -> bytes:
+    # Render all speech into one mono track. Cues are intentionally not auto-downloaded.
+    max_end = 0.05
+    for item in timeline:
+        if item.get("kind") == "speech":
+            max_end = max(max_end, item["start"] + item["duration"])
+    base = silence_wav(max_end + 0.05)
+    for item in timeline:
+        if item.get("kind") == "speech":
+            base = mix_wavs(base, audio_by_index[item["index"]], item["start"])
+    return base
 
 # =========================================================
 # SRT
 # =========================================================
 
-def srt_time(seconds):
-    ms = int(round(seconds * 1000))
-
-    hours, ms = divmod(ms, 3600000)
-    minutes, ms = divmod(ms, 60000)
-    secs, ms = divmod(ms, 1000)
-
-    return f"{hours:02}:{minutes:02}:{secs:02},{ms:03}"
+def srt_time(sec: float) -> str:
+    ms = int(round(sec * 1000))
+    h = ms // 3600000; ms %= 3600000
+    m = ms // 60000; ms %= 60000
+    s = ms // 1000; ms %= 1000
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def make_srt(segments, speed_factor=1.0):
-    """
-    speed_factor=1.5なら、
-    1.5倍速後の時間に合わせてSRTを作る。
-    """
-
-    current = 0.0
-    output = []
-
-    for index, seg in enumerate(segments, 1):
-
-        original_duration = seg["duration"]
-
-        # 1.5倍速なら実時間は1/1.5
-        actual_duration = original_duration / speed_factor
-
-        start = current
-        end = current + actual_duration
-
-        speaker = seg["speaker"]
-        text = seg["text"]
-
-        output.append(
-            f"{index}\n"
-            f"{srt_time(start)} --> {srt_time(end)}\n"
-            f"{speaker}: {text}\n"
-        )
-
-        current = end
-
-    return "\n".join(output)
-
+def make_srt(timeline: List[Dict], speed_factor: float = 1.0) -> str:
+    out = []
+    n = 1
+    for item in timeline:
+        if item.get("kind") != "speech":
+            continue
+        start = item["start"] / speed_factor
+        end = (item["start"] + item["duration"]) / speed_factor
+        label = speaker_label(item["speaker"])
+        text = item["text"].strip()
+        out.append(f"{n}\n{srt_time(start)} --> {srt_time(end)}\n[{label}] {text}\n")
+        n += 1
+    return "\n".join(out)
 
 # =========================================================
-# Gemini TTS
+# SE / BGM recommendations
 # =========================================================
 
-def tts(client, text, voice):
-    """
-    Gemini TTSで日本語音声を生成する。
-    返り値はWAVではなく、Geminiが返したPCMデータをWAV化したもの。
-    """
+SE_KEYWORDS = {
+    "豪雨": ["heavy rain", "rainstorm", "rain"],
+    "雨": ["rain"],
+    "川": ["river", "water", "stream"],
+    "濁流": ["river", "water", "flood"],
+    "泳": ["water splash", "splash"],
+    "平手打ち": ["slap", "hit"],
+    "殴": ["punch", "hit"],
+    "走": ["footsteps", "running"],
+    "足音": ["footsteps"],
+    "歓声": ["crowd cheer", "cheering"],
+    "扉": ["door", "door close"],
+    "剣": ["sword", "blade"],
+    "倒れ": ["fall", "body fall"],
+    "風": ["wind"],
+    "山賊": ["footsteps", "forest", "wind"],
+}
 
-    text = str(text).strip()
-
-    if not text:
-        raise RuntimeError("TTSに渡す文章が空です。")
-
-    prompt = (
-        "Read the following Japanese text naturally and expressively. "
-        "Speak only the Japanese text. "
-        "Do not explain it, translate it, or add any words.\n\n"
-        "Japanese text:\n"
-        + text
-    )
-
-    r = client.interactions.create(
-        model="gemini-3.1-flash-tts-preview",
-        input=prompt,
-        response_format={"type": "audio"},
-        generation_config={
-            "speech_config": [
-                {
-                    "voice": voice
-                }
-            ]
-        }
-    )
-
-    # Geminiの音声データを取得
-    if not hasattr(r, "output_audio") or r.output_audio is None:
-        raise RuntimeError("Geminiから音声データが返されませんでした。")
-
-    audio_data = r.output_audio.data
-
-    if audio_data is None:
-        raise RuntimeError("Geminiから空の音声データが返されました。")
-
-    # Base64文字列の場合
-    if isinstance(audio_data, str):
-        pcm_data = base64.b64decode(audio_data)
-    else:
-        pcm_data = bytes(audio_data)
-
-    if not pcm_data:
-        raise RuntimeError("音声データが空です。")
-
-    # PCM → WAV
-    wav_buffer = io.BytesIO()
-
-    with wave.open(wav_buffer, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(24000)
-        wf.writeframes(pcm_data)
-
-    return wav_buffer.getvalue()
+BGM_KEYWORDS = {
+    "不穏": ["dark", "tension", "suspense"],
+    "緊張": ["tension", "suspense", "dramatic"],
+    "怒": ["dramatic", "dark", "intense"],
+    "走": ["action", "adventure", "fast"],
+    "絶望": ["sad", "dramatic", "dark"],
+    "希望": ["hope", "uplifting", "inspiring"],
+    "感動": ["emotional", "piano", "inspiring"],
+    "クライマックス": ["cinematic", "epic", "dramatic"],
+    "コミカル": ["comedy", "funny", "light"],
+}
 
 
-def tts_with_recovery(client, text, voice):
-    """
-    TTS生成。
-    
-    1. 通常サイズで生成
-    2. 失敗したら短くして再試行
-    3. それでも失敗したらさらに分割
-    """
-
-    text = normalize_text(text)
-
-    if not text:
-        return []
-
-    # -----------------------------------------------------
-    # まず通常サイズで分割
-    # -----------------------------------------------------
-
-    chunks = split_text(
-        text,
-        DEFAULT_CHUNK_CHARS
-    )
-
-    results = []
-
-    for chunk in chunks:
-
-        success = False
-
-        # -------------------------------------------------
-        # 通常リトライ
-        # -------------------------------------------------
-
-        for attempt in range(MAX_RETRIES):
-
-            try:
-
-                audio = tts(
-                    client,
-                    chunk,
-                    voice
-                )
-
-                results.append(
-                    {
-                        "audio": audio,
-                        "text": chunk
-                    }
-                )
-
-                success = True
-                break
-
-            except Exception as e:
-
-                error_text = str(e)
-
-                # Safety / stream / 400系など
-                # 同じ文章を何度も投げ続けない
-                if attempt < MAX_RETRIES - 1:
-
-                    time.sleep(
-                        1.5 * (attempt + 1)
-                    )
-
-                else:
-
-                    # -------------------------------------
-                    # ここから細分化
-                    # -------------------------------------
-
-                    smaller_chunks = split_text(
-                        chunk,
-                        RETRY_CHUNK_CHARS
-                    )
-
-                    if len(smaller_chunks) <= 1:
-                        raise RuntimeError(
-                            "音声生成に失敗しました。\n\n"
-                            f"キャラクター: {voice}\n"
-                            f"文章: {chunk}\n\n"
-                            f"Geminiエラー:\n{error_text}"
-                        )
-
-                    # 細分化したものを再帰的に生成
-                    smaller_results = []
-
-                    for small_chunk in smaller_chunks:
-
-                        small_audio = tts_with_recovery(
-                            client,
-                            small_chunk,
-                            voice
-                        )
-
-                        smaller_results.extend(
-                            small_audio
-                        )
-
-                    results.extend(
-                        smaller_results
-                    )
-
-                    success = True
-
-        if not success:
-            raise RuntimeError(
-                "音声生成に失敗しました。"
-            )
-
-    return results
-
+def cue_suggestions(cue_type: str, cue_text: str) -> Dict:
+    text = cue_text.lower()
+    mapping = SE_KEYWORDS if cue_type == "SE" else BGM_KEYWORDS
+    keywords = []
+    for k, vals in mapping.items():
+        if k.lower() in text:
+            keywords.extend(vals)
+    if not keywords:
+        keywords = [cue_text]
+    keywords = list(dict.fromkeys(keywords))[:5]
+    q = "+".join(re.sub(r"[^a-zA-Z0-9 +_-]", " ", x).strip().replace(" ", "+") for x in keywords)
+    return {
+        "keywords": keywords,
+        "youtube": "https://www.youtube.com/audiolibrary/music?nv=1",
+        "dova": f"https://dova-s.jp/" if cue_type == "BGM" else "https://dova-s.jp/se/",
+        "query": q,
+    }
 
 # =========================================================
-# 脚本生成
+# Gemini script generation
 # =========================================================
 
-def make_script(client, source, minutes, roles):
-
-    source = normalize_text(source)
-
-    role_text = "、".join(roles)
-
+def generate_script(client, source: str, minutes: int) -> str:
     prompt = f"""
-あなたはYouTubeチャンネル「5分で名作」の脚本家です。
+あなたは日本語の朗読ドラマ脚本家です。
+原作を約{minutes}分のYouTube向け朗読ドラマに再構成してください。
 
-以下の原作を、視聴者が最後まで見たくなる
-「短く、速く、インパクトのある物語」
-として再構成してください。
+必ず以下のフォーマットで出力してください。
 
-解説動画にはしないでください。
-あくまで「物語」として語ってください。
+# VOICE CAST
+### NARRATOR
+成人。落ち着いた日本語男性ナレーター。
+### MEROS
+キャラクターの声質・演技方針を書く。
+### DIONYS
+キャラクターの声質・演技方針を書く。
 
-目標尺:
-{minutes}分
+# SCRIPT
+[NARRATOR | 演技指示]
+本文
 
-重要:
-- 原作の重要な出来事だけ残す
-- 冗長な説明は削る
-- 冒頭からすぐ物語を始める
-- 展開を早める
-- 感情が動く場面は残す
-- 最後のオチ・結末はしっかり描く
-- キャラクターのセリフを適切に入れる
-- ナレーションだけで全部説明しない
-- セリフは自然な日本語にする
-- 原作の雰囲気をなるべく残す
-- YouTubeで聞きやすい文章にする
+[MEROS | 演技指示]
+本文
 
-使用可能な話者:
-{role_text}
+[SE想定：必要なら効果音の内容]
+[BGM：必要なら音楽の雰囲気]
+[画像：必要なら画面の内容]
 
-話者名は必ず上記の名前のどれかを使用してください。
+同時発話は [MEROS & SELINUNTIUS | 同時に、涙声] のように書く。
+必要な間は [WAIT 1.0] のように書く。
+最後は [END]。
 
-以下のJSONだけを返してください。
-
-{{
-  "title": "作品タイトル",
-  "segments": [
-    {{
-      "speaker": "ナレーター",
-      "text": "..."
-    }},
-    {{
-      "speaker": "メロス",
-      "text": "..."
-    }}
-  ],
-  "image_instructions": [
-    {{
-      "time_hint": "0:00",
-      "visual": "画面に欲しいイラスト"
-    }}
-  ],
-  "se_instructions": [
-    {{
-      "time_hint": "0:00",
-      "sound": "欲しい効果音",
-      "purpose": "何のためのSEか"
-    }}
-  ],
-  "bgm_instructions": [
-    {{
-      "time_hint": "0:00",
-      "mood": "BGMの雰囲気",
-      "purpose": "何のためのBGMか"
-    }}
-  ]
-}}
+AI音声でそのまま演技できる程度に、短いセリフ単位で構成する。
+SE/BGM/画像指示は音声として読ませない。
 
 原作:
 {source}
 """
-
-    response = client.interactions.create(
-        model=SCRIPT_MODEL,
-        input=prompt
-    )
-
-    output = response.output_text
-
-    # JSON部分だけ取り出す
-    match = re.search(
-        r"\{.*\}",
-        output,
-        re.DOTALL
-    )
-
-    if not match:
-        raise RuntimeError(
-            "脚本JSONを取得できませんでした。"
-        )
-
-    try:
-        return json.loads(
-            match.group()
-        )
-
-    except json.JSONDecodeError as e:
-        raise RuntimeError(
-            "脚本JSONの解析に失敗しました。\n"
-            + str(e)
-        )
-
-
+    response = client.models.generate_content(model=GEMINI_SCRIPT_MODEL, contents=prompt)
+    return response.text
 
 # =========================================================
-# 完成済み脚本の解析
+# UI
 # =========================================================
 
-SPECIAL_HEADERS = {
-    "SE", "BGM", "画像", "画像指示", "映像", "映像指示",
-    "効果音"
-}
-
-
-def normalize_speaker_name(name):
-    """【メロス】 / [メロス] / メロス: などをキャラクター名に整える。"""
-    name = str(name).strip()
-    name = re.sub(r"^[【\[\(（]\s*", "", name)
-    name = re.sub(r"\s*[】\]\)）]\s*$", "", name)
-    return name.strip(" :：")
-
-
-def parse_script_json(data):
-    """ChatGPT等で作ったJSON脚本を読み込む。"""
-    if isinstance(data, str):
-        data = json.loads(data)
-
-    if not isinstance(data, dict):
-        raise RuntimeError("脚本JSONはオブジェクト形式にしてください。")
-
-    segments = []
-    for item in data.get("segments", []):
-        if not isinstance(item, dict):
-            continue
-        speaker = str(item.get("speaker", "ナレーター")).strip() or "ナレーター"
-        text = normalize_text(item.get("text", ""))
-        if text:
-            segments.append({"speaker": speaker, "text": text})
-
-    if not segments:
-        raise RuntimeError("脚本JSONのsegmentsに音声用文章がありません。")
-
-    return {
-        "title": data.get("title", "完成脚本"),
-        "segments": segments,
-        "image_instructions": data.get("image_instructions", []),
-        "se_instructions": data.get("se_instructions", []),
-        "bgm_instructions": data.get("bgm_instructions", [])
-    }
-
-
-def parse_plain_script(text):
-    """
-    完成済みTXT/MDを解析。
-
-    推奨:
-      【ナレーター】
-      本文
-
-      【メロス】
-      「私は必ず戻る！」
-
-    【SE】/【BGM】/【画像】は音声化せず編集指示として保存。
-    話者指定のない文章はナレーター扱い。
-    """
-    text = normalize_text(text)
-    if not text:
-        raise RuntimeError("脚本が空です。")
-
-    lines = text.split("\n")
-    segments = []
-    images = []
-    ses = []
-    bgms = []
-    current_speaker = None
-    current_lines = []
-    special = None
-    special_lines = []
-    title = "完成脚本"
-
-    header_re = re.compile(r"^\s*(?:【([^】]+)】|\[([^\]]+)\])\s*$")
-    title_re = re.compile(r"^\s*#\s+(.+?)\s*$")
-
-    def flush_speech():
-        nonlocal current_lines
-        if current_speaker and current_lines:
-            body = normalize_text("\n".join(current_lines))
-            if body:
-                segments.append({"speaker": current_speaker, "text": body})
-        current_lines = []
-
-    def flush_special():
-        nonlocal special, special_lines
-        if not special:
-            return
-        body = normalize_text("\n".join(special_lines))
-        if body:
-            if special in {"SE", "効果音"}:
-                ses.append({"time_hint": "", "sound": body, "purpose": ""})
-            elif special == "BGM":
-                bgms.append({"time_hint": "", "mood": body, "purpose": ""})
-            else:
-                images.append({"time_hint": "", "visual": body})
-        special = None
-        special_lines = []
-
-    for raw in lines:
-        line = raw.strip()
-        if not line:
-            continue
-
-        tm = title_re.match(line)
-        if tm and not segments and current_speaker is None:
-            title = tm.group(1).strip()
-            continue
-
-        hm = header_re.match(line)
-        if hm:
-            header = normalize_speaker_name(hm.group(1) or hm.group(2) or "")
-            if header in {"タイトル", "TITLE", "TITLE:"}:
-                flush_special()
-                flush_speech()
-                continue
-            if header in SPECIAL_HEADERS:
-                flush_speech()
-                flush_special()
-                special = header
-                special_lines = []
-                continue
-            flush_special()
-            flush_speech()
-            current_speaker = header or "ナレーター"
-            continue
-
-        if special:
-            special_lines.append(line)
-        else:
-            if current_speaker is None:
-                current_speaker = "ナレーター"
-            current_lines.append(line)
-
-    flush_special()
-    flush_speech()
-
-    if not segments:
-        raise RuntimeError(
-            "脚本から音声用のセリフを読み取れませんでした。\n\n"
-            "推奨形式:\n【ナレーター】\n本文\n\n【メロス】\nセリフ"
-        )
-
-    return {
-        "title": title,
-        "segments": segments,
-        "image_instructions": images,
-        "se_instructions": ses,
-        "bgm_instructions": bgms
-    }
-
-
-def parse_uploaded_script(raw_text):
-    """JSONならJSON脚本、それ以外ならTXT/MD脚本として解析。"""
-    raw_text = raw_text.strip()
-    if raw_text.startswith("{") and raw_text.endswith("}"):
-        try:
-            return parse_script_json(json.loads(raw_text))
-        except Exception:
-            pass
-    return parse_plain_script(raw_text)
-
-
-# =========================================================
-# Streamlit UI
-# =========================================================
-
-if "cast" not in st.session_state:
-    st.session_state.cast = DEFAULT.copy()
-
-
-st.title("📖 5分で名作・自動音声制作")
-
-st.caption(
-    "原作 → 脚本 → キャラ別TTS → 自動分割 → 結合 → 1.5倍速 → SRT"
-)
-
-
-# =========================================================
-# サイドバー
-# =========================================================
+st.title("📖 5分で名作 — 朗読ドラマ制作アプリ")
+st.caption("原作→脚本→音声→タイムライン→SRT。普段は無料のローカルAivisSpeech、必要時のみGemini TTS。")
 
 with st.sidebar:
+    st.header("⚙️ 設定")
+    engine = st.radio("音声エンジン", ["AivisSpeech（無料・ローカル）", "Gemini TTS（クラウド）"], index=0)
+    speed = st.slider("完成音声の速度", 1.0, 2.0, 1.5, 0.05)
+    pause = st.slider("セリフ間の基本の間（秒）", 0.0, 0.8, 0.12, 0.02)
+    if engine.startswith("Aivis"):
+        aivis_url = st.text_input("AivisSpeech Engine URL", AIVIS_DEFAULT_URL)
+        st.caption("AivisSpeech EngineをPCで起動してください。既定ポートは10101です。")
+    else:
+        aivis_url = AIVIS_DEFAULT_URL
+        gemini_key = st.text_input("Gemini API Key", type="password")
 
-    st.subheader("🔑 Gemini")
+st.divider()
 
-    api_key = st.text_input(
-        "Gemini API Key",
-        type="password"
-    )
+mode = st.radio("入力方法", ["原作からGeminiで脚本を作る", "完成した脚本をそのまま使う"], horizontal=True)
+source_text = ""
 
-    st.caption(
-        "APIキーはこの画面だけに入力してください。"
-    )
-
-    st.divider()
-
-    st.subheader("🎙 キャスト")
-
-    for role in list(st.session_state.cast):
-
-        current_voice = st.session_state.cast[role]
-
-        if current_voice not in VOICES:
-            current_voice = "Kore"
-
-        st.session_state.cast[role] = st.selectbox(
-            role,
-            VOICES,
-            index=VOICES.index(current_voice),
-            key=f"voice_{role}"
-        )
-
-    st.divider()
-
-    if st.button("＋キャラクター追加"):
-
-        n = 1
-
-        while f"キャラクター{n}" in st.session_state.cast:
-            n += 1
-
-        st.session_state.cast[
-            f"キャラクター{n}"
-        ] = "Kore"
-
-        st.rerun()
-
-
-# =========================================================
-# 入力方式
-# =========================================================
-
-st.subheader("📚 入力方式")
-
-input_mode = st.radio(
-    "どちらを使いますか？",
-    [
-        "原作から脚本を自動生成",
-        "完成した脚本をそのまま使用"
-    ],
-    horizontal=True
-)
-
-source = ""
-
-if input_mode == "原作から脚本を自動生成":
-
-    st.info(
-        "原作を入れるとGeminiが脚本を作り、その後キャラクター別に音声化します。"
-    )
-
-    uploaded = st.file_uploader(
-        "📚 原作 TXT / MD",
-        type=["txt", "md"],
-        key="source_upload"
-    )
-
+if mode == "原作からGeminiで脚本を作る":
+    uploaded = st.file_uploader("原作ファイル（txt / md）", type=["txt", "md"])
     if uploaded:
-        source = uploaded.read().decode("utf-8", "replace")
-        st.success(f"読み込みました：{uploaded.name}")
+        source_text = uploaded.read().decode("utf-8", errors="replace")
     else:
-        source = st.text_area(
-            "または原作本文を貼り付け",
-            height=220,
-            placeholder="ここに青空文庫などの原作本文を貼り付けます。",
-            key="source_text"
-        )
-
+        source_text = st.text_area("原作を貼り付け", height=260)
+    minutes = st.slider("目標動画時間（分）", 3, 10, 5)
+    if st.button("🪄 Geminiで脚本を生成", type="primary", disabled=not source_text.strip()):
+        if not gemini_key:
+            st.error("脚本生成にはGemini API Keyが必要です。")
+        elif genai is None:
+            st.error("google-genai がインストールされていません。requirements.txtを確認してください。")
+        else:
+            try:
+                client = genai.Client(api_key=gemini_key)
+                with st.spinner("脚本を生成しています…"):
+                    generated = generate_script(client, source_text, minutes)
+                st.session_state["script"] = generated
+            except Exception as e:
+                st.error(f"脚本生成に失敗しました：{e}")
 else:
-
-    st.info(
-        "ChatGPTなどで作った完成脚本を、そのまま音声制作に使えます。"
-        " このモードでは脚本生成用のGemini APIを呼びません。"
-    )
-
-    uploaded_script = st.file_uploader(
-        "📜 完成した脚本 TXT / MD / JSON",
-        type=["txt", "md", "json"],
-        key="script_upload"
-    )
-
+    uploaded_script = st.file_uploader("完成脚本（txt / md）", type=["txt", "md"])
     if uploaded_script:
-        source = uploaded_script.read().decode("utf-8", "replace")
-        st.success(f"読み込みました：{uploaded_script.name}")
+        st.session_state["script"] = uploaded_script.read().decode("utf-8", errors="replace")
     else:
-        source = st.text_area(
-            "または完成脚本を貼り付け",
-            height=300,
-            placeholder=(
-                "【ナレーター】\n"
-                "メロスは激怒した。\n\n"
-                "【メロス】\n"
-                "「私は必ず戻る！」\n\n"
-                "【王】\n"
-                "「ふん、戻るはずがない。」\n\n"
-                "【SE】\n重い扉が開く音\n\n"
-                "【BGM】\n不穏で重い雰囲気\n\n"
-                "【画像】\n暗い王城。王の前に立つメロス。"
-            ),
-            key="script_text"
-        )
+        st.session_state.setdefault("script", "")
 
-    with st.expander("📌 完成脚本の書き方"):
-        st.markdown(
-            """
-**基本形**
+script = st.text_area("現在の脚本", value=st.session_state.get("script", ""), height=500)
+st.session_state["script"] = script
 
-```text
-【ナレーター】
-メロスは激怒した。
+if script.strip():
+    cast, segments, cues = parse_script(script)
+    st.subheader("🎭 脚本解析")
+    speech_count = sum(1 for s in segments if s.kind == "speech")
+    st.write(f"セリフ {speech_count}件 / 指示 {len(cues)}件")
 
-【メロス】
-「私は必ず戻る！」
+    # Detect simultaneous speech markers and normalize speakers.
+    for seg in segments:
+        if seg.kind == "speech":
+            roles = [normalize_role(x) for x in re.split(r"\s*&\s*|＆", seg.speaker)]
+            if len(roles) > 1:
+                # Expand later in generation UI. The first role keeps this segment's index;
+                # subsequent roles share the same index with a synthetic key.
+                pass
 
-【王】
-「ふん、戻るはずがない。」
+    st.subheader("🎙️ キャスト")
+    role_names = sorted({normalize_role(s.speaker) for s in segments if s.kind == "speech"})
 
-【セリヌンティウス】
-「メロスを信じる。」
+    aivis_speakers = []
+    if engine.startswith("Aivis"):
+        try:
+            aivis_speakers = flatten_aivis_speakers(aivis_get_speakers(aivis_url))
+            st.success(f"AivisSpeech接続OK：{len(aivis_speakers)}スタイルを取得")
+        except Exception:
+            st.warning("AivisSpeech Engineに接続できません。PCでAivisSpeechを起動してから再試行してください。")
 
-【SE】
-重い扉が閉まる音
-
-【BGM】
-不穏で重い雰囲気
-
-【画像】
-暗い王城。王の前に立つメロス。
-```
-
-- `【キャラクター名】` → そのキャラクターの声
-- `【SE】` → 音声化せずSE指示として保存
-- `【BGM】` → 音声化せずBGM指示として保存
-- `【画像】` → 音声化せず画像指示として保存
-- 話者指定のない文章 → ナレーター
-- JSON脚本（`segments`形式）もアップロード可能
-"""
-        )
-
-
-# =========================================================
-# 尺
-# =========================================================
-
-minutes = st.radio(
-    "🎬 動画の長さ",
-    [1, 5, 10],
-    index=1,
-    horizontal=True
-)
-
-
-# =========================================================
-# 生成
-# =========================================================
-
-generate = st.button(
-    "🚀 生成開始",
-    type="primary",
-    disabled=not (
-        api_key and
-        source.strip()
-    )
-)
-
-
-if generate:
-
-    try:
-
-        client = genai.Client(
-            api_key=api_key
-        )
-
-        with st.status(
-            "🎬 制作中…",
-            expanded=True
-        ):
-
-            # ---------------------------------------------
-            # STEP 1
-            # ---------------------------------------------
-
-            if input_mode == "原作から脚本を自動生成":
-
-                st.write(
-                    "① 原作から脚本を生成しています…"
-                )
-
-                result = make_script(
-                    client,
-                    source,
-                    minutes,
-                    list(st.session_state.cast.keys())
-                )
-
+    cast_config = {}
+    for role in role_names:
+        meta = DEFAULT_ROLE_MAP.get(role, {"label": role, "gemini": GEMINI_VOICES[0]})
+        label = meta.get("label", role)
+        with st.expander(f"{label}（{role}）", expanded=True):
+            if engine.startswith("Aivis"):
+                if aivis_speakers:
+                    options = [f"{x['speaker_name']} / {x['style_name']} / ID {x['speaker_id']}" for x in aivis_speakers]
+                    default = 0
+                    if role == "DIONYS":
+                        default = min(2, len(options)-1)
+                    elif role in ("MEROS", "FILOSTRATUS"):
+                        default = min(1, len(options)-1)
+                    choice = st.selectbox("AivisSpeechモデル/スタイル", options, index=default, key=f"aiv_{role}")
+                    cast_config[role] = {"engine": "aivis", "style": aivis_speakers[options.index(choice)]}
+                else:
+                    cast_config[role] = {"engine": "aivis", "style": None}
             else:
+                default_voice = meta.get("gemini", GEMINI_VOICES[0])
+                voice = st.selectbox("Gemini Voice", GEMINI_VOICES, index=GEMINI_VOICES.index(default_voice) if default_voice in GEMINI_VOICES else 0, key=f"gem_{role}")
+                cast_config[role] = {"engine": "gemini", "voice": voice}
+            intensity = st.slider("感情強度", 0.0, 2.0, 1.0, 0.1, key=f"int_{role}")
+            cast_config[role]["intonation"] = intensity
 
-                st.write(
-                    "① 完成済み脚本を読み込んでいます…"
-                )
-
-                result = parse_uploaded_script(source)
-
-            segments = result.get(
-                "segments",
-                []
-            )
-
-            if not segments:
-                raise RuntimeError(
-                    "脚本にセグメントがありません。"
-                )
-
-            st.write(
-                f"脚本完成：{len(segments)}セグメント"
-            )
-
-            # ---------------------------------------------
-            # STEP 2
-            # 音声生成
-            # ---------------------------------------------
-
-            st.write(
-                "② キャラクター別音声を生成しています…"
-            )
-
-            all_audio = []
-            timed_segments = []
-
-            total_segments = len(segments)
-
-            progress = st.progress(0)
-
-            for index, segment in enumerate(
-                segments
-            ):
-
-                speaker = segment.get(
-                    "speaker",
-                    "ナレーター"
-                )
-
-                text = normalize_text(
-                    segment.get(
-                        "text",
-                        ""
-                    )
-                )
-
-                # 存在しないキャラならナレーター
-                if speaker not in st.session_state.cast:
-                    st.warning(
-                        f"「{speaker}」がキャストに登録されていないため、ナレーターの声を使用します。"
-                    )
-                    speaker = "ナレーター"
-
-                if not text:
-                    progress.progress(
-                        (index + 1) / total_segments
-                    )
-                    continue
-
-                voice = st.session_state.cast[
-                    speaker
-                ]
-
-                st.write(
-                    f"🎙 {speaker} / {voice}"
-                )
-
-                generated_parts = tts_with_recovery(
-                    client,
-                    text,
-                    voice
-                )
-
-                for part in generated_parts:
-
-                    audio = part["audio"]
-
-                    part_text = part["text"]
-
-                    part_duration = duration(
-                        audio
-                    )
-
-                    all_audio.append(
-                        audio
-                    )
-
-                    timed_segments.append(
-                        {
-                            "speaker": speaker,
-                            "text": part_text,
-                            "duration": part_duration
-                        }
-                    )
-
-                progress.progress(
-                    (index + 1) / total_segments
-                )
-
-            if not all_audio:
-                raise RuntimeError(
-                    "音声を1つも生成できませんでした。"
-                )
-
-            # ---------------------------------------------
-            # STEP 3
-            # 結合
-            # ---------------------------------------------
-
-            st.write(
-                "③ 音声を一本に結合しています…"
-            )
-
-            original_audio = join_wav(
-                all_audio
-            )
-
-            # ---------------------------------------------
-            # STEP 4
-            # 1.5倍速
-            # ---------------------------------------------
-
-            st.write(
-                "④ 1.5倍速版を作っています…"
-            )
-
-            fast_audio = speed_up(
-                original_audio,
-                SPEED
-            )
-
-            # ---------------------------------------------
-            # STEP 5
-            # SRT
-            # ---------------------------------------------
-
-            st.write(
-                "⑤ 1.5倍速版に合わせて字幕を作っています…"
-            )
-
-            srt = make_srt(
-                timed_segments,
-                SPEED
-            )
-
-            # ---------------------------------------------
-            # 保存
-            # ---------------------------------------------
-
-            result["timed_segments"] = (
-                timed_segments
-            )
-
-            st.session_state.result = result
-            st.session_state.original = (
-                original_audio
-            )
-            st.session_state.fast = (
-                fast_audio
-            )
-            st.session_state.srt = srt
-
-        st.success(
-            "🎉 完成しました！"
-        )
-
-    except Exception as e:
-
-        st.error(
-            "音声生成中にエラーが発生しました。"
-        )
-
-        st.code(
-            str(e)
-        )
-
-
-# =========================================================
-# 結果表示
-# =========================================================
-
-if "result" in st.session_state:
-
-    result = st.session_state.result
+    st.subheader("🎬 SE / BGM / 画像指示")
+    if not cues:
+        st.info("脚本にSE/BGM/画像指示がありません。必要なら [SE想定：...] / [BGM：...] / [画像：...] を追加してください。")
+    else:
+        for cue in cues:
+            sug = cue_suggestions(cue["type"], cue["text"])
+            st.markdown(f"**{cue['type']}：{cue['text']}**")
+            st.write("検索キーワード：", ", ".join(sug["keywords"]))
+            if cue["type"] in ("SE", "BGM"):
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.link_button("YouTube Audio Libraryを開く", sug["youtube"])
+                with c2:
+                    st.link_button("DOVAを開く", sug["dova"])
+                st.caption("YouTube Audio LibraryはYouTube公式の音楽・効果音。CCの場合は帰属表示が必要です。素材を採用したら下のクレジット欄に記録してください。")
 
     st.divider()
+    if st.button("🎙️ 音声を生成して一本化", type="primary"):
+        if engine.startswith("Aivis") and not aivis_speakers:
+            st.error("AivisSpeech Engineに接続できません。まずAivisSpeechを起動してください。")
+        elif engine.startswith("Gemini") and not gemini_key:
+            st.error("Gemini API Keyを入力してください。")
+        else:
+            client = None
+            if engine.startswith("Gemini"):
+                client = genai.Client(api_key=gemini_key)
+            audio_by_index = {}
+            progress = st.progress(0.0)
+            speech_segments = [s for s in segments if s.kind == "speech"]
+            errors = []
+            for n, seg in enumerate(speech_segments, start=1):
+                role_parts = [normalize_role(x) for x in re.split(r"\s*&\s*|＆", seg.speaker)]
+                # For simultaneous dialogue, generate the first speaker's audio here and
+                # the second speaker's audio under a synthetic segment key.
+                for part_i, role in enumerate(role_parts):
+                    key = seg.index if part_i == 0 else seg.index * 1000 + part_i
+                    cfg = cast_config.get(role)
+                    if not cfg:
+                        cfg = {"engine": engine.split("（")[0].lower()}
+                    try:
+                        if engine.startswith("Aivis"):
+                            style = cfg.get("style")
+                            if not style:
+                                raise RuntimeError(f"{role}のAivisSpeechスタイルが選択されていません。")
+                            audio_by_index[key] = aivis_synthesize(
+                                aivis_url, seg.text, int(style["speaker_id"]),
+                                speed=1.0, intonation=cfg.get("intonation", 1.0)
+                            )
+                        else:
+                            voice = cfg.get("voice", GEMINI_VOICES[0])
+                            audio_by_index[key] = gemini_synthesize(client, seg.text, voice, seg.direction)
+                    except Exception as e:
+                        errors.append(f"#{seg.index} {role}: {e}")
+                progress.progress(n / max(1, len(speech_segments)))
+            if errors:
+                st.error("一部の音声生成に失敗しました。")
+                for e in errors[:10]:
+                    st.code(e)
+            else:
+                # Build timeline, including synthetic simultaneous voices.
+                timeline = []
+                cursor = 0.0
+                for seg in segments:
+                    if seg.kind == "wait":
+                        cursor += float(seg.start or 0)
+                        timeline.append({"index": seg.index, "kind": "wait", "start": cursor, "duration": float(seg.start or 0)})
+                        continue
+                    if seg.kind == "cue":
+                        timeline.append({"index": seg.index, "kind": seg.cue_type, "cue": seg.cue_text, "start": cursor})
+                        continue
+                    role_parts = [normalize_role(x) for x in re.split(r"\s*&\s*|＆", seg.speaker)]
+                    if len(role_parts) > 1:
+                        durs = [wav_duration(audio_by_index[seg.index if i == 0 else seg.index*1000+i]) for i in range(len(role_parts))]
+                        dur = max(durs or [0])
+                        for i, role in enumerate(role_parts):
+                            key = seg.index if i == 0 else seg.index*1000+i
+                            timeline.append({"index": key, "source_index": seg.index, "kind": "speech", "speaker": role,
+                                             "direction": seg.direction, "text": seg.text, "start": cursor, "duration": wav_duration(audio_by_index[key]),
+                                             "simultaneous": True})
+                        cursor += dur + pause
+                    else:
+                        dur = wav_duration(audio_by_index[seg.index])
+                        timeline.append({"index": seg.index, "source_index": seg.index, "kind": "speech", "speaker": role_parts[0],
+                                         "direction": seg.direction, "text": seg.text, "start": cursor, "duration": dur})
+                        cursor += dur + pause
+                # Mix using synthetic keys.
+                max_end = max([x.get("start", 0)+x.get("duration", 0) for x in timeline if x.get("kind") == "speech"] + [0.1])
+                final = silence_wav(max_end + 0.2)
+                for item in timeline:
+                    if item.get("kind") == "speech":
+                        final = mix_wavs(final, audio_by_index[item["index"]], item["start"])
+                final_fast = speed_up_wav(final, speed)
+                srt = make_srt(timeline, speed)
+                credits = [
+                    "5分で名作 — 音声・素材クレジット", "",
+                    f"Voice engine: {engine}",
+                    f"Playback speed: {speed}x", "",
+                ]
+                for role, cfg in cast_config.items():
+                    if cfg.get("engine") == "aivis" and cfg.get("style"):
+                        x = cfg["style"]
+                        credits.append(f"{role}: AivisSpeech / {x['speaker_name']} / {x['style_name']} / style_id={x['speaker_id']}")
+                    elif cfg.get("engine") == "gemini":
+                        credits.append(f"{role}: Google Gemini TTS / {cfg.get('voice')}")
+                credits += ["", "SE/BGM: 使用素材ごとに、提供元のライセンス条件と必要な帰属表示を動画説明欄へ追加してください."]
+                st.session_state["final_wav"] = final
+                st.session_state["final_fast"] = final_fast
+                st.session_state["srt"] = srt
+                st.session_state["timeline"] = timeline
+                st.session_state["credits"] = "\n".join(credits)
+                st.success("音声をタイムライン化して一本にしました。")
 
-    st.header(
-        "🎬 " + result.get(
-            "title",
-            "完成"
-        )
-    )
+if st.session_state.get("final_wav"):
+    st.divider()
+    st.subheader("🎧 完成音声")
+    st.audio(st.session_state["final_fast"], format="audio/wav")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.download_button("WAV（元速度）", st.session_state["final_wav"], "master.wav", "audio/wav")
+    with c2:
+        st.download_button("WAV（1.5倍など設定速度）", st.session_state["final_fast"], "master_fast.wav", "audio/wav")
+    with c3:
+        st.download_button("SRT字幕", st.session_state["srt"], "subtitles.srt", "application/x-subrip")
 
-    # ---------------------------------------------
-    # 音声
-    # ---------------------------------------------
+    st.subheader("📋 タイムライン")
+    for item in st.session_state.get("timeline", []):
+        if item.get("kind") == "speech":
+            st.write(f"{item['start']:.2f}s — {speaker_label(item['speaker'])} — {item['text']}")
+        elif item.get("kind") in ("SE", "BGM", "IMAGE"):
+            st.write(f"{item['start']:.2f}s — {item['kind']} — {item['cue']}")
+        else:
+            st.write(f"{item['start']:.2f}s — WAIT {item.get('duration', 0):.2f}s")
 
-    col1, col2 = st.columns(2)
+    st.subheader("🧾 クレジット記録")
+    st.code(st.session_state.get("credits", ""), language="text")
+    st.download_button("クレジットTXT", st.session_state.get("credits", ""), "credits.txt", "text/plain")
 
-    with col1:
-
-        st.subheader(
-            "🎧 元音声"
-        )
-
-        st.audio(
-            st.session_state.original,
-            format="audio/wav"
-        )
-
-        st.download_button(
-            "⬇ 元音声 WAV",
-            st.session_state.original,
-            "audio_original.wav",
-            "audio/wav"
-        )
-
-    with col2:
-
-        st.subheader(
-            "⚡ 1.5倍速版"
-        )
-
-        st.audio(
-            st.session_state.fast,
-            format="audio/wav"
-        )
-
-        st.download_button(
-            "⬇ 1.5倍速 WAV",
-            st.session_state.fast,
-            "audio_1.5x.wav",
-            "audio/wav"
-        )
-
-    # ---------------------------------------------
-    # SRT
-    # ---------------------------------------------
-
-    st.subheader(
-        "💬 字幕"
-    )
-
-    st.download_button(
-        "⬇ SRT字幕",
-        st.session_state.srt,
-        "subtitles.srt",
-        "application/x-subrip"
-    )
-
-    # ---------------------------------------------
-    # 制作指示
-    # ---------------------------------------------
-
-    st.subheader(
-        "🎨 編集用指示"
-    )
-
-    notes = {
-        "images": result.get(
-            "image_instructions",
-            []
-        ),
-        "SE": result.get(
-            "se_instructions",
-            []
-        ),
-        "BGM": result.get(
-            "bgm_instructions",
-            []
-        )
-    }
-
-    st.download_button(
-        "⬇ 画像・SE・BGM指示 JSON",
-        json.dumps(
-            notes,
-            ensure_ascii=False,
-            indent=2
-        ),
-        "production_notes.json",
-        "application/json"
-    )
-
-    # ---------------------------------------------
-    # 脚本
-    # ---------------------------------------------
-
-    with st.expander(
-        "📜 完成した脚本を見る"
-    ):
-
-        for segment in result.get(
-            "segments",
-            []
-        ):
-
-            speaker = segment.get(
-                "speaker",
-                "ナレーター"
-            )
-
-            text = segment.get(
-                "text",
-                ""
-            )
-
-            st.markdown(
-                f"**{speaker}**　{text}"
-            )
-
-    # ---------------------------------------------
-    # 画像指示
-    # ---------------------------------------------
-
-    with st.expander(
-        "🖼 画像指示を見る"
-    ):
-
-        for item in result.get(
-            "image_instructions",
-            []
-        ):
-
-            st.markdown(
-                f"**{item.get('time_hint', '')}** "
-                f"{item.get('visual', '')}"
-            )
-
-    # ---------------------------------------------
-    # SE
-    # ---------------------------------------------
-
-    with st.expander(
-        "🔊 SE指示を見る"
-    ):
-
-        for item in result.get(
-            "se_instructions",
-            []
-        ):
-
-            st.markdown(
-                f"**{item.get('time_hint', '')}** "
-                f"{item.get('sound', '')} "
-                f"— {item.get('purpose', '')}"
-            )
-
-    # ---------------------------------------------
-    # BGM
-    # ---------------------------------------------
-
-    with st.expander(
-        "🎵 BGM指示を見る"
-    ):
-
-        for item in result.get(
-            "bgm_instructions",
-            []
-        ):
-
-            st.markdown(
-                f"**{item.get('time_hint', '')}** "
-                f"{item.get('mood', '')} "
-                f"— {item.get('purpose', '')}"
-            )
+st.divider()
+st.caption("素材の採用前に各素材ページのライセンスを確認してください。YouTube Audio LibraryはYouTube公式の音楽・効果音ライブラリです。")
