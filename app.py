@@ -45,19 +45,39 @@ def make_srt(segs):
         t+=d
     return "\n".join(out)
 
-def tts(client,text,voice):
+def tts(client, text, voice):
     prompt = (
         "Synthesize ONLY the Japanese spoken text after the marker. "
         "Use expressive, natural, fast-paced audiobook narration. "
-        "Do not read instructions aloud.\n=== SPOKEN TEXT ===\n" + text
+        "Do not read instructions aloud.\n"
+        "=== SPOKEN TEXT ===\n" + text
     )
-    r=client.interactions.create(
+
+    r = client.interactions.create(
         model="gemini-3.1-flash-tts-preview",
         input=prompt,
-        response_format={"type":"audio"},
-        generation_config={"speech_config":[{"voice":voice}]})
-    raw=r.output_audio.data
-    return base64.b64decode(raw) if isinstance(raw,str) else raw
+        response_format={"type": "audio"},
+        generation_config={
+            "speech_config": [
+                {"voice": voice}
+            ]
+        }
+    )
+
+    raw = r.output_audio.data
+
+    # Gemini TTSの出力は生PCMなのでWAVに変換する
+    pcm = base64.b64decode(raw) if isinstance(raw, str) else raw
+
+    wav_buffer = io.BytesIO()
+
+    with wave.open(wav_buffer, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(24000)
+        wf.writeframes(pcm)
+
+    return wav_buffer.getvalue()
 
 def make_script(client,src,minutes,roles):
     prompt = (
