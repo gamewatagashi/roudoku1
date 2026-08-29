@@ -419,11 +419,11 @@ def tts_with_recovery(client, text, voice):
 
             try:
 
-                audio = raw_tts(
-                    client,
-                    chunk,
-                    voice
-                )
+                audio = tts(
+    client,
+    chunk,
+    voice
+)
 
                 results.append(
                     {
