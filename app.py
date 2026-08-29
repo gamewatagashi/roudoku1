@@ -320,24 +320,29 @@ def make_srt(segments, speed_factor=1.0):
 # Gemini TTS
 # =========================================================
 
-def raw_tts(client, text, voice):
+def tts(client, text, voice):
     """
-    Gemini TTSを1回だけ呼ぶ。
-
-    ここでは「速く喋る」と指定しない。
-    最後に1.5倍速にするため。
+    Gemini TTSで日本語音声を生成。
+    長い文章は呼び出し側で分割する。
     """
 
-    # なるべく指示文を簡潔にする。
-    # 長いメタプロンプトはSafety判定や読み上げ事故を避けるため使用しない。
-    prompt = (
-        "自然で感情のこもった日本語の朗読として読み上げてください。"
-        "文章そのもの以外は読み上げないでください。\n\n"
-        + text
-    )
+    text = str(text).strip()
 
-    response = client.interactions.create(
-        model=TTS_MODEL,
+    if not text:
+        raise RuntimeError("TTSに渡す文章が空です。")
+
+    # 指示と本文を明確に分離
+    prompt = f"""
+Read the following Japanese text naturally and expressively.
+Do not add, remove, translate, or explain anything.
+Only speak the Japanese text.
+
+Japanese text:
+{text}
+"""
+
+    r = client.interactions.create(
+        model="gemini-3.1-flash-tts-preview",
         input=prompt,
         response_format={"type": "audio"},
         generation_config={
@@ -349,10 +354,12 @@ def raw_tts(client, text, voice):
         }
     )
 
-    if not getattr(response, "output_audio", None):
-        raise RuntimeError("Geminiから音声データが返されませんでした。")
+    if not getattr(r, "output_audio", None):
+        raise RuntimeError(
+            "Geminiから音声データが返されませんでした。"
+        )
 
-    raw = response.output_audio.data
+    raw = r.output_audio.data
 
     if isinstance(raw, str):
         pcm = base64.b64decode(raw)
@@ -360,9 +367,20 @@ def raw_tts(client, text, voice):
         pcm = raw
 
     if not pcm:
-        raise RuntimeError("Geminiから空の音声データが返されました。")
+        raise RuntimeError(
+            "Geminiから空の音声データが返されました。"
+        )
 
-    return pcm_to_wav(pcm)
+    # PCM → WAV
+    wav_buffer = io.BytesIO()
+
+    with wave.open(wav_buffer, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(24000)
+        wf.writeframes(pcm)
+
+    return wav_buffer.getvalue()
 
 
 def tts_with_recovery(client, text, voice):
