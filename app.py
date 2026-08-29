@@ -420,10 +420,10 @@ def tts_with_recovery(client, text, voice):
             try:
 
                 audio = tts(
-    client,
-    chunk,
-    voice
-)
+                    client,
+                    chunk,
+                    voice
+                )
 
                 results.append(
                     {
@@ -607,6 +607,173 @@ def make_script(client, source, minutes, roles):
         )
 
 
+
+# =========================================================
+# 完成済み脚本の解析
+# =========================================================
+
+SPECIAL_HEADERS = {
+    "SE", "BGM", "画像", "画像指示", "映像", "映像指示",
+    "効果音"
+}
+
+
+def normalize_speaker_name(name):
+    """【メロス】 / [メロス] / メロス: などをキャラクター名に整える。"""
+    name = str(name).strip()
+    name = re.sub(r"^[【\[\(（]\s*", "", name)
+    name = re.sub(r"\s*[】\]\)）]\s*$", "", name)
+    return name.strip(" :：")
+
+
+def parse_script_json(data):
+    """ChatGPT等で作ったJSON脚本を読み込む。"""
+    if isinstance(data, str):
+        data = json.loads(data)
+
+    if not isinstance(data, dict):
+        raise RuntimeError("脚本JSONはオブジェクト形式にしてください。")
+
+    segments = []
+    for item in data.get("segments", []):
+        if not isinstance(item, dict):
+            continue
+        speaker = str(item.get("speaker", "ナレーター")).strip() or "ナレーター"
+        text = normalize_text(item.get("text", ""))
+        if text:
+            segments.append({"speaker": speaker, "text": text})
+
+    if not segments:
+        raise RuntimeError("脚本JSONのsegmentsに音声用文章がありません。")
+
+    return {
+        "title": data.get("title", "完成脚本"),
+        "segments": segments,
+        "image_instructions": data.get("image_instructions", []),
+        "se_instructions": data.get("se_instructions", []),
+        "bgm_instructions": data.get("bgm_instructions", [])
+    }
+
+
+def parse_plain_script(text):
+    """
+    完成済みTXT/MDを解析。
+
+    推奨:
+      【ナレーター】
+      本文
+
+      【メロス】
+      「私は必ず戻る！」
+
+    【SE】/【BGM】/【画像】は音声化せず編集指示として保存。
+    話者指定のない文章はナレーター扱い。
+    """
+    text = normalize_text(text)
+    if not text:
+        raise RuntimeError("脚本が空です。")
+
+    lines = text.split("\n")
+    segments = []
+    images = []
+    ses = []
+    bgms = []
+    current_speaker = None
+    current_lines = []
+    special = None
+    special_lines = []
+    title = "完成脚本"
+
+    header_re = re.compile(r"^\s*(?:【([^】]+)】|\[([^\]]+)\])\s*$")
+    title_re = re.compile(r"^\s*#\s+(.+?)\s*$")
+
+    def flush_speech():
+        nonlocal current_lines
+        if current_speaker and current_lines:
+            body = normalize_text("\n".join(current_lines))
+            if body:
+                segments.append({"speaker": current_speaker, "text": body})
+        current_lines = []
+
+    def flush_special():
+        nonlocal special, special_lines
+        if not special:
+            return
+        body = normalize_text("\n".join(special_lines))
+        if body:
+            if special in {"SE", "効果音"}:
+                ses.append({"time_hint": "", "sound": body, "purpose": ""})
+            elif special == "BGM":
+                bgms.append({"time_hint": "", "mood": body, "purpose": ""})
+            else:
+                images.append({"time_hint": "", "visual": body})
+        special = None
+        special_lines = []
+
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+
+        tm = title_re.match(line)
+        if tm and not segments and current_speaker is None:
+            title = tm.group(1).strip()
+            continue
+
+        hm = header_re.match(line)
+        if hm:
+            header = normalize_speaker_name(hm.group(1) or hm.group(2) or "")
+            if header in {"タイトル", "TITLE", "TITLE:"}:
+                flush_special()
+                flush_speech()
+                continue
+            if header in SPECIAL_HEADERS:
+                flush_speech()
+                flush_special()
+                special = header
+                special_lines = []
+                continue
+            flush_special()
+            flush_speech()
+            current_speaker = header or "ナレーター"
+            continue
+
+        if special:
+            special_lines.append(line)
+        else:
+            if current_speaker is None:
+                current_speaker = "ナレーター"
+            current_lines.append(line)
+
+    flush_special()
+    flush_speech()
+
+    if not segments:
+        raise RuntimeError(
+            "脚本から音声用のセリフを読み取れませんでした。\n\n"
+            "推奨形式:\n【ナレーター】\n本文\n\n【メロス】\nセリフ"
+        )
+
+    return {
+        "title": title,
+        "segments": segments,
+        "image_instructions": images,
+        "se_instructions": ses,
+        "bgm_instructions": bgms
+    }
+
+
+def parse_uploaded_script(raw_text):
+    """JSONならJSON脚本、それ以外ならTXT/MD脚本として解析。"""
+    raw_text = raw_text.strip()
+    if raw_text.startswith("{") and raw_text.endswith("}"):
+        try:
+            return parse_script_json(json.loads(raw_text))
+        except Exception:
+            pass
+    return parse_plain_script(raw_text)
+
+
 # =========================================================
 # Streamlit UI
 # =========================================================
@@ -674,28 +841,115 @@ with st.sidebar:
 
 
 # =========================================================
-# 原作入力
+# 入力方式
 # =========================================================
 
-uploaded = st.file_uploader(
-    "📚 原作 TXT / MD",
-    type=["txt", "md"]
+st.subheader("📚 入力方式")
+
+input_mode = st.radio(
+    "どちらを使いますか？",
+    [
+        "原作から脚本を自動生成",
+        "完成した脚本をそのまま使用"
+    ],
+    horizontal=True
 )
 
-if uploaded:
+source = ""
 
-    source = uploaded.read().decode(
-        "utf-8",
-        "replace"
+if input_mode == "原作から脚本を自動生成":
+
+    st.info(
+        "原作を入れるとGeminiが脚本を作り、その後キャラクター別に音声化します。"
     )
+
+    uploaded = st.file_uploader(
+        "📚 原作 TXT / MD",
+        type=["txt", "md"],
+        key="source_upload"
+    )
+
+    if uploaded:
+        source = uploaded.read().decode("utf-8", "replace")
+        st.success(f"読み込みました：{uploaded.name}")
+    else:
+        source = st.text_area(
+            "または原作本文を貼り付け",
+            height=220,
+            placeholder="ここに青空文庫などの原作本文を貼り付けます。",
+            key="source_text"
+        )
 
 else:
 
-    source = st.text_area(
-        "または本文を貼り付け",
-        height=220,
-        placeholder="ここに青空文庫などの本文を貼り付けます。"
+    st.info(
+        "ChatGPTなどで作った完成脚本を、そのまま音声制作に使えます。"
+        " このモードでは脚本生成用のGemini APIを呼びません。"
     )
+
+    uploaded_script = st.file_uploader(
+        "📜 完成した脚本 TXT / MD / JSON",
+        type=["txt", "md", "json"],
+        key="script_upload"
+    )
+
+    if uploaded_script:
+        source = uploaded_script.read().decode("utf-8", "replace")
+        st.success(f"読み込みました：{uploaded_script.name}")
+    else:
+        source = st.text_area(
+            "または完成脚本を貼り付け",
+            height=300,
+            placeholder=(
+                "【ナレーター】\n"
+                "メロスは激怒した。\n\n"
+                "【メロス】\n"
+                "「私は必ず戻る！」\n\n"
+                "【王】\n"
+                "「ふん、戻るはずがない。」\n\n"
+                "【SE】\n重い扉が開く音\n\n"
+                "【BGM】\n不穏で重い雰囲気\n\n"
+                "【画像】\n暗い王城。王の前に立つメロス。"
+            ),
+            key="script_text"
+        )
+
+    with st.expander("📌 完成脚本の書き方"):
+        st.markdown(
+            """
+**基本形**
+
+```text
+【ナレーター】
+メロスは激怒した。
+
+【メロス】
+「私は必ず戻る！」
+
+【王】
+「ふん、戻るはずがない。」
+
+【セリヌンティウス】
+「メロスを信じる。」
+
+【SE】
+重い扉が閉まる音
+
+【BGM】
+不穏で重い雰囲気
+
+【画像】
+暗い王城。王の前に立つメロス。
+```
+
+- `【キャラクター名】` → そのキャラクターの声
+- `【SE】` → 音声化せずSE指示として保存
+- `【BGM】` → 音声化せずBGM指示として保存
+- `【画像】` → 音声化せず画像指示として保存
+- 話者指定のない文章 → ナレーター
+- JSON脚本（`segments`形式）もアップロード可能
+"""
+        )
 
 
 # =========================================================
@@ -741,16 +995,26 @@ if generate:
             # STEP 1
             # ---------------------------------------------
 
-            st.write(
-                "① 脚本を生成しています…"
-            )
+            if input_mode == "原作から脚本を自動生成":
 
-            result = make_script(
-                client,
-                source,
-                minutes,
-                list(st.session_state.cast.keys())
-            )
+                st.write(
+                    "① 原作から脚本を生成しています…"
+                )
+
+                result = make_script(
+                    client,
+                    source,
+                    minutes,
+                    list(st.session_state.cast.keys())
+                )
+
+            else:
+
+                st.write(
+                    "① 完成済み脚本を読み込んでいます…"
+                )
+
+                result = parse_uploaded_script(source)
 
             segments = result.get(
                 "segments",
@@ -800,6 +1064,9 @@ if generate:
 
                 # 存在しないキャラならナレーター
                 if speaker not in st.session_state.cast:
+                    st.warning(
+                        f"「{speaker}」がキャストに登録されていないため、ナレーターの声を使用します。"
+                    )
                     speaker = "ナレーター"
 
                 if not text:
